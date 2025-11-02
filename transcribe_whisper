@@ -1,0 +1,39 @@
+import sys
+from faster_whisper import WhisperModel
+from pathlib import Path
+
+# Parametrlər: model ölçüsü və hesablamanın tipi
+MODEL_SIZE = "base"   # "tiny", "base", "small" (VM-də "base int8" yaxşı balansdır)
+COMPUTE    = "int8"   # "int8", "int8_float16", "int16", "float32"
+DEVICE     = "cpu"    # VM-də CPU
+
+def transcribe_file(audio_path: str):
+    audio = Path(audio_path)
+    if not audio.exists():
+        print(f"❌ Tapılmadı: {audio}")
+        sys.exit(1)
+
+    print(f"🔊 Fayl: {audio}")
+    print(f"🧠 Model: {MODEL_SIZE}, device={DEVICE}, compute_type={COMPUTE}")
+
+    model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE)
+
+    segments, info = model.transcribe(
+        str(audio),
+        vad_filter=True,       # daxili VAD filtri kömək edir
+        beam_size=1,           # CPU-da sürət üçün 1
+        best_of=1,
+        language=None          # None = avtomatik dil aşkarlanması
+    )
+    print(f"🌐 Dil: {info.language} | no_speech_prob={getattr(info, 'no_speech_prob', None)}")
+
+    text = "".join(s.text for s in segments).strip()
+    print("\n=== Nəticə ===")
+    print(text)
+    return text
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("İstifadə: python transcribe_whisper.py <audio.wav/mp3/m4a>")
+        sys.exit(1)
+    transcribe_file(sys.argv[1])
