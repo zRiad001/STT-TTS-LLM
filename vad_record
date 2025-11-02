@@ -1,0 +1,131 @@
+import sounddevice as sd
+import numpy as np
+import webrtcvad
+import collections
+import wave
+import time
+import signal
+
+RATE = 16000
+FRAME_DURATION = 30  # ms (allowed: 10 / 20 / 30)
+FRAME_SIZE = int(RATE * FRAME_DURATION / 1000)
+
+# VAD AGGRESSIVENESS:
+# 0 = most strict (harder to trigger, needs clear voice)
+# 3 = most sensitive (triggers on tiny noise)
+VAD = webrtcvad.Vad(0)   # was 1 before -> now less sensitive
+
+MAX_DURATION_S = 120     # safety cap
+
+# how "sticky" recording is:
+START_TRIGGER_FRAMES = 10   # how many voiced frames in a row before we "start"
+STOP_TRIGGER_FRAMES  = 45   # how many silence frames in a row before we "stop"
+
+
+def record_vad(output="output.wav", silence_limit=1.6, device=None):
+    """
+    Voice-activated recorder:
+    - waits until it hears real voice (not tiny noise)
+    - records
+    - stops after sustained silence
+    """
+
+    if device is not None:
+        sd.default.device = device
+
+    # buffer of recent silence while we're already recording
+    ring_buffer = collections.deque(
+        maxlen=int(silence_limit * 1000 / FRAME_DURATION)
+    )
+
+    frames = []
+    recording = False
+    voiced_streak = 0
+    silence_streak = 0
+    started_at = time.time()
+
+    print("🎙️ Danış — sükut zamanı dayandırılacaq...  (Ctrl+C = məcburi stop)")
+
+    def handle_sigint(sig, frame):
+        print("\n⏹️ Ctrl+C ilə dayandırıldı.")
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    try:
+        with sd.RawInputStream(
+            samplerate=RATE,
+            blocksize=FRAME_SIZE,
+            dtype='int16',
+            channels=1,
+            device=device
+        ) as stream:
+            while True:
+                # safety hard stop
+                if time.time() - started_at > MAX_DURATION_S and recording:
+                    print("⏹️ Maksimum müddətə çatdı, yazma dayandırıldı.")
+                    break
+
+                raw_frame, overflowed = stream.read(FRAME_SIZE)
+                if overflowed:
+                    print("⚠️ Audio buffer overflow (mikrofon gecikməsi)")
+
+                frame = np.frombuffer(raw_frame, dtype=np.int16)
+
+                # VAD decision
+                is_speech = VAD.is_speech(frame.tobytes(), RATE)
+
+                if not recording:
+                    # we haven't started yet
+                    if is_speech:
+                        voiced_streak += 1
+                        if voiced_streak >= START_TRIGGER_FRAMES:
+                            print("▶️ Səs aşkarlandı, yazma başladı...")
+                            recording = True
+                            frames.append(frame.copy())
+                            ring_buffer.clear()
+                            silence_streak = 0
+                    else:
+                        voiced_streak = 0  # reset if no consistent speech
+                else:
+                    # we are already recording
+                    if is_speech:
+                        frames.append(frame.copy())
+                        ring_buffer.clear()
+                        silence_streak = 0
+                    else:
+                        ring_buffer.append(frame.copy())
+                        silence_streak += 1
+                        if silence_streak >= STOP_TRIGGER_FRAMES:
+                            print("⏹️ Sükut zamanı keçdi, yazma dayandırıldı.")
+                            break
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        if frames:
+            try:
+                with wave.open(output, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(RATE)
+                    wf.writeframes(np.concatenate(frames).tobytes())
+
+                duration = len(frames) * FRAME_SIZE / RATE
+                print(f"💾 Yadda saxlanıldı: {output}")
+                print(f"⏱️ Müddət: {duration:.2f} saniyə")
+                print(f"📊 Frame sayı: {len(frames)}")
+                return output
+
+            except Exception as e:
+                print(f"❌ Fayl yazma xətası: {e}")
+                return None
+        else:
+            print("⚠️ Heç nə yazılmadı (səs aşkarlanmadı).")
+            print("💡 Məsləhət: danışanda bir az yüksək səslə başla ki, START_TRIGGER_FRAMES dolsun.")
+            return None
+
+
+if __name__ == "__main__":
+    record_vad(output="output.wav", silence_limit=1.0)
