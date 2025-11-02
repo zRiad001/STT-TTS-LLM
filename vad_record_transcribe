@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Riad Project — Addım 11
+VAD əsaslı səs yazıcı + Vosk transkripsiya çağırışı
+
+Qeyd: Terminal emoji-ləri encoding xətası verərsə, UTF‑8 rejimini aktiv edin:
+- Birdəfəlik: `PYTHONUTF8=1 python3 vad_rec_transcribe.py`
+- və ya sabit: `export PYTHONUTF8=1`
+- Avtomatik input device seçimi (istəsən əl ilə də yaza bilərsən)
+- Preroll/postroll, histerezis, NOISE_GATE
+- SRT/TXT üçün transcribe_vosk.py çağırışı (CALL_TRANSCRIBE=True olduqda)
+"""
+
+import os, sys, time, wave, struct, collections
+import webrtcvad
+import sounddevice as sd
+
+# --- Output encoding guard (emoji/special chars safe) ---
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='ignore')
+    sys.stderr.reconfigure(encoding='utf-8', errors='ignore')
+except Exception:
+    pass
+
+# ====================== USER SETTINGS ======================
+# Cihaz seçimi: None → avtomatik input kanallı ilk cihazı tapır.
+# Konkret indeks bilirsənsə, məsələn MIC ADC (hw:0,1) üçün 1 yaz.
+DEVICE_INDEX   = 12      # pulse (bizdə işləyir)
+SAMPLE_RATE    = 48000   # Pulse üçün real native rate
+CHANNELS       = 1       # Pulse-da mono istifadə et
+NOISE_GATE     = 300
+START_TRIGGER_FRAMES = 8
+STOP_TRIGGER_FRAMES  = 40
+FRAME_MS       = 20       # frame uzunluğu (ms)
+DTYPE          = 'int16'
+VAD_LEVEL      = 2        # daha sərt (0..3)
+
+NOISE_GATE           = 500  # |amplituda| həddi (400–900 aralığında oynat)
+MIN_HOLD_AFTER_START_MS   = 900  # startdan sonra bu qədər müddət stop etmə
+MIN_SPEECH_MS             = 1200 # faydalı danışıq minimumu (ms)
+# Kontekst:
+PREROLL_FRAMES = 15   # ~300 ms
+POSTROLL_FRAMES = 10  # ~200 ms
+# Davranış:
+EXIT_AFTER_FIRST_STOP = True
+MAX_DURATION_S = 180
+OUT_WAV        = "output.wav"
+CALL_TRANSCRIBE= True
+# ====================== USER SETTINGS ======================
+
+FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)  # frame başına N nümunə (kanal başına)
+FRAME_BYTES   = FRAME_SAMPLES * 2 * CHANNELS         # hər nümunə int16, CHANNELS-ə vurulur
+
+
+def write_wav(path, sample_rate, pcm16_bytes):
+    with wave.open(path, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm16_bytes)
+
+
+def rms16(samples):
+    # sadə RMS (float istifadə etmirik ki, sürətli olsun)
+    s2 = 0
+    for s in samples:
+        s2 += s*s
+    # qeyri-xətti kök — kifayət qədər dəqiqdir burada
+    return (s2 // max(1, len(samples))) ** 0.5
+
+
+def pick_input_device(prefer_index=None):
+    """Input kanallı cihaz seçimi. prefer_index verilmişsə, onu qaytarır."""
+    try:
+        if prefer_index is not None:
+            return prefer_index
+        devs = sd.query_devices()
+        # max_input_channels > 0 olan ilk cihazı götür
+        for i, d in enumerate(devs):
+            if d.get('max_input_channels', 0) > 0:
+                return i
+    except Exception:
+        pass
+    return 0  # fallback
+
+
+def main():
+    global DEVICE_INDEX
+
+    # Cihazı seç
+    DEVICE_INDEX = pick_input_device(DEVICE_INDEX)
+
+    # sounddevice default-lar
+    sd.default.device     = DEVICE_INDEX
+    sd.default.samplerate = SAMPLE_RATE
+    sd.default.channels   = CHANNELS
+    sd.default.dtype      = DTYPE
+
+    print(f"\U0001F399\ufe0f VAD recorder @ {SAMPLE_RATE} Hz, {FRAME_MS} ms frames → {FRAME_BYTES} bytes")
+    print(f"\U0001F527 Using input device index: {DEVICE_INDEX}")
+
+    vad  = webrtcvad.Vad(VAD_LEVEL)
+    ring = collections.deque(maxlen=STOP_TRIGGER_FRAMES)
+
+    in_speech       = False
+    recording       = False
+    bytes_buf       = bytearray()
+    preroll         = collections.deque(maxlen=PREROLL_FRAMES)
+    tail_postroll   = collections.deque(maxlen=POSTROLL_FRAMES)
+    all_audio       = bytearray()
+    overall_start   = time.time()
+    start_time      = 0.0
+    hold_until_time = 0.0
+
+    # Kalibrasiya üçün sadə pik logu (startdan əvvəl hər ~0.5 s)
+    last_pk_log = [0.0]
+
+    def push_to_output(frame_bytes):
+        nonlocal all_audio
+        all_audio.extend(frame_bytes)
+
+    def handle_frame(frame_bytes):
+        nonlocal in_speech, recording, start_time, hold_until_time
+        # frame ölçüsü dəqiq olsun (multi‑channel nəzərə alınıb)
+        if len(frame_bytes) != FRAME_BYTES:
+            bytes_buf.extend(frame_bytes)
+            while len(bytes_buf) >= FRAME_BYTES:
+                chunk = bytes(bytes_buf[:FRAME_BYTES])
+                del bytes_buf[:FRAME_BYTES]
+                handle_frame(chunk)
+            return
+
+        # --- Downmix to mono (əgər CHANNELS>1) ---
+        total_samples = len(frame_bytes) // 2
+        samples_all = struct.unpack('<%dh' % total_samples, frame_bytes)
+        if CHANNELS > 1:
+            # 2 kanal varsayırıq; daha çox olarsa, ortalama/max ala bilərsən
+            mono = []
+            for i in range(0, total_samples, CHANNELS):
+                # sadə ortalama: L,R → mono
+                acc = 0
+                cnt = 0
+                for c in range(CHANNELS):
+                    if i + c < total_samples:
+                        acc += samples_all[i + c]
+                        cnt += 1
+                mono.append(int(acc / max(1, cnt)))
+            mono_bytes = struct.pack('<%dh' % len(mono), *mono)
+            samples = mono
+        else:
+            mono_bytes = frame_bytes
+            samples = samples_all
+
+        # NOISE-GATE + VAD mono üzrə
+        pk = max(abs(s) for s in samples) if samples else 0
+        gate_silence = (pk < NOISE_GATE)
+        voiced = (not gate_silence) and vad.is_speech(mono_bytes, SAMPLE_RATE)
+        ring.append(1 if voiced else 0)
+
+        # startdan əvvəl pk-ləri göstər (kalibrasiya üçün)
+        now = time.time()
+        if not in_speech and now - last_pk_log[0] > 0.5:
+            print(f"   ↪︎ pk={pk}")
+            last_pk_log[0] = now
+
+        # preroll-u həmişə saxla (yazıya başlamamışdan əvvəlki ~300ms)
+        preroll.append(mono_bytes)
+
+        # START
+        if not in_speech:
+            if sum(ring) >= START_TRIGGER_FRAMES:
+                in_speech = True
+                recording = True
+                start_time = now
+                hold_until_time = now + (MIN_HOLD_AFTER_START_MS / 1000.0)
+                print("▶️ Başladı (speech detected)")
+                # preroll-u çıxışa dump et ki, ilk hecalar kəsilməsin
+                while preroll:
+                    push_to_output(preroll.popleft())
+                # cari frame-i də yaz
+                push_to_output(mono_bytes)
+                return
+            else:
+                # hələ başlamamışıq — çıxışa yazmırıq
+                return
+
+        # Danışıqda: yazmağa davam et
+        if recording:
+            push_to_output(mono_bytes)
+            tail_postroll.append(mono_bytes)
+
+        # STOP
+        if in_speech:
+            if now < hold_until_time:
+                return  # startdan dərhal sonra stop etmə
+            # “flap”ı azaltmaq üçün çox az aktivlik də stop sayılır
+            if sum(ring) <= 2 and len(ring) >= STOP_TRIGGER_FRAMES:
+                in_speech = False
+                print("⏹️ Dayandırıldı (silence)")
+                # postroll (qısa quyruq) əlavə et
+                while tail_postroll:
+                    push_to_output(tail_postroll.popleft())
+                if EXIT_AFTER_FIRST_STOP:
+                    return "STOP"
+
+        # NOISE-GATE + VAD
+        samples = struct.unpack("<%dh" % (len(frame_bytes)//2), frame_bytes)
+        pk = max(abs(s) for s in samples)
+        gate_silence = (pk < NOISE_GATE)
+        voiced = (not gate_silence) and vad.is_speech(frame_bytes, SAMPLE_RATE)
+        ring.append(1 if voiced else 0)
+
+        # startdan əvvəl pk-ləri göstər (kalibrasiya üçün)
+        now = time.time()
+        if not in_speech and now - last_pk_log[0] > 0.5:
+            print(f"   ↪︎ pk={pk}")
+            last_pk_log[0] = now
+
+        # preroll-u həmişə saxla (yazıya başlamamışdan əvvəlki ~300ms)
+        preroll.append(frame_bytes)
+
+        # START
+        if not in_speech:
+            if sum(ring) >= START_TRIGGER_FRAMES:
+                in_speech = True
+                recording = True
+                start_time = now
+                hold_until_time = now + (MIN_HOLD_AFTER_START_MS / 1000.0)
+                print("▶️ Başladı (speech detected)")
+                # preroll-u çıxışa dump et ki, ilk hecalar kəsilməsin
+                while preroll:
+                    push_to_output(preroll.popleft())
+                # cari frame-i də yaz
+                push_to_output(frame_bytes)
+                return
+            else:
+                # hələ başlamamışıq — çıxışa yazmırıq
+                return
+
+        # Danışıqda: yazmağa davam et
+        if recording:
+            push_to_output(frame_bytes)
+            tail_postroll.append(frame_bytes)
+
+        # STOP
+        if in_speech:
+            if now < hold_until_time:
+                return  # startdan dərhal sonra stop etmə
+            # “flap”ı azaltmaq üçün çox az aktivlik də stop sayılır
+            if sum(ring) <= 2 and len(ring) >= STOP_TRIGGER_FRAMES:
+                in_speech = False
+                print("⏹️ Dayandırıldı (silence)")
+                # postroll (qısa quyruq) əlavə et
+                while tail_postroll:
+                    push_to_output(tail_postroll.popleft())
+                if EXIT_AFTER_FIRST_STOP:
+                    return "STOP"
+
+    try:
+        with sd.RawInputStream(
+            device=DEVICE_INDEX,
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype=DTYPE,
+            blocksize=FRAME_SAMPLES,
+        ) as stream:
+            print("\ud83d\udce2 Danış — sükutda avtomatik dayanacaq. (Ctrl+C ilə də dayandırmaq olar)")
+            while True:
+                data, _ = stream.read(FRAME_SAMPLES)
+                if not data:
+                    continue
+                res = handle_frame(bytes(data))
+                if res == "STOP" and EXIT_AFTER_FIRST_STOP:
+                    break
+                if time.time() - overall_start > MAX_DURATION_S:
+                    print("⏳ Vaxt limiti çatdı — dayandırılır.")
+                    break
+    except KeyboardInterrupt:
+        print("\n🛑 Klaviaturadan dayandırıldı.")
+    except Exception as e:
+        print("❌ Stream açılmadı:", e)
+        sys.exit(1)
+
+    # çox qısa danışıq olmasın
+    speech_ms = (len(all_audio) / FRAME_BYTES) * FRAME_MS
+    if speech_ms < MIN_SPEECH_MS:
+        print(f"⚠️ Çox qısa audio ({int(speech_ms)} ms). Hədləri yumşalt və ya bir az daha uzun danış.")
+        # Yenə də yazırıq ki, yoxlaya biləsən
+    write_wav(OUT_WAV, SAMPLE_RATE, bytes(all_audio))
+    print(f"💾 Yadda saxlanıldı: {OUT_WAV}  (~{int(speech_ms)} ms)")
+
+    if CALL_TRANSCRIBE and os.path.exists("transcribe_vosk.py"):
+        print("📝 Transkripsiya başlayır (vosk)...")
+        rc = os.system(f"python3 transcribe_vosk.py {OUT_WAV} --model ./model --no-grammar")
+        if rc != 0:
+            print("⚠️ transcribe_vosk.py uğursuz çıxdı.")
+    else:
+        if CALL_TRANSCRIBE:
+            print("ℹ️ transcribe_vosk.py tapılmadı — yalnız WAV saxlandı.")
+
+
+if __name__ == "__main__":
+    try:
+        import webrtcvad  # noqa: F401
+    except ImportError:
+        print("⚠️ webrtcvad paketini quraşdır:  pip install webrtcvad")
+        sys.exit(1)
+    main()
