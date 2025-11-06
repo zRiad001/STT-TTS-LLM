@@ -1,146 +1,167 @@
+# record_and_transcribe.py  (CPU-only, clean)
 from pathlib import Path
+import argparse
+import os
+import tempfile
+import subprocess
+import json
+
+import requests
+import simpleaudio as sa
+
 from vad_record import record_vad
 from faster_whisper import WhisperModel
 
-
-import requests
+# ---- TTS: Piper (yerli, oflayn) və gTTS (fallback, onlayn) ----
 from gtts import gTTS
-import os
 
-def speak(text: str, lang="en"):
-    """Natural-sounding voice using gTTS (Google TTS)"""
-    try:
-        tts = gTTS(text=text, lang=lang)
-        tts.save("/tmp/tts.mp3")
-        os.system("mpg123 /tmp/tts.mp3 > /dev/null 2>&1")
-    except Exception as e:
-        print("TTS error:", e)
-
-
-
-
-
-
-def record_and_transcribe():
-    out = Path.home() / "Desktop" / "output.wav"
-
-    # SƏS YAZ (sənin mövcud funksiyanın imzasına uyğundur)
-    file_path = record_vad(
-        output=str(out),
-        silence_limit=1.2,   # istəyinə görə dəyişə bilərsən
-        device=None          # lazım olsa indeks ver
-    )
-    if not file_path or not Path(file_path).exists():
-        print("❌ Səs yazıla bilmədi.")
-        return
-
-    print(f"🎧 Yazılmış fayl: {file_path}")
-
-    # WHISPER STT
-    print("🧠 Whisper transkripsiya başlayır...")
-    model = WhisperModel("base", device="cpu", compute_type="int8")  # "tiny" daha sürətli
-    segments, info = model.transcribe(str(out), vad_filter=True, beam_size=1, best_of=1)
-    print(f"🌐 Dil: {info.language}")
-
-    text = "".join(s.text for s in segments).strip()
-    print("\n📝 Nəticə:")
-    print(text or "[boş]")
-# After printing STT text:
-    if text:
-        reply = ollama_chat(text)
-        print("\n🤖 Reply:\n" + reply)
-        piper_tts(reply)
-# --- ADD: LLM + TTS ---
-import os, json, tempfile, subprocess, requests
-import simpleaudio as sa
-from pathlib import Path
-
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-LLM_MODEL   = os.environ.get("LLM_MODEL", "qwen2.5:7b-instruct")
 PIPER_BIN   = os.environ.get("PIPER_BIN", str(Path.home() / "Desktop/piper/piper"))
-PIPER_MODEL = os.environ.get("PIPER_MODEL", str(Path.home() / "Desktop/piper_voices/en_US-amy-medium.onnx"))
+PIPER_MODEL = str(Path.home() / "Desktop/piper_voices/en_US-ryan-medium.onnx")
 
 
 
+OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/v1/chat/completions")
+OLLAMA_MODEL = os.environ.get("LLM_MODEL", "mistral:latest")  # səndə quraşdırılmış model adı
 
 
-# replace your ollama_chat() with this generate-only version
-import requests
-
-OLLAMA_URL = "http://127.0.0.1:11434/v1/chat/completions"
-MODEL_NAME = "mistral"  # Səndə hansı modeldirsə onu yaz (məs: "llama3", "phi3", nədirsə)
-
-import requests
-
-
-
-
+def speak_gtts(text: str, lang="en"):
+    """Fallback TTS: gTTS + mpg123 (internet tələb edir)"""
+    try:
+        tmp_mp3 = "/tmp/tts.mp3"
+        tts = gTTS(text=text, lang=lang)
+        tts.save(tmp_mp3)
+        os.system(f"mpg123 {tmp_mp3} > /dev/null 2>&1")
+    except Exception as e:
+        print("TTS(gTTS) error:", e)
 
 
+def piper_tts(text: str):
+    """Offline TTS using Piper"""
+    if not Path(PIPER_BIN).exists():
+        raise RuntimeError(f"Piper binary not found: {PIPER_BIN}")
+    if not Path(PIPER_MODEL).exists():
+        raise RuntimeError(f"Piper model not found: {PIPER_MODEL}")
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+        outwav = tf.name
+
+    # ---- Burada düzgün indentasiya ----
+    cmd = [
+        PIPER_BIN,
+        "--model", PIPER_MODEL,
+        "--output_file", outwav,
+        "--length_scale", "1.30",      # yavaş danışıq
+        "--noise_scale", "0.33",       # artikulyasiya
+        "--noise_w", "0.55",           # intonasiya
+        "--sentence_silence", "0.20"   # cümlələrarası pauza
+    ]
+
+    p = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+
+    _, err = p.communicate(input=text.encode("utf-8"))
+    if p.returncode != 0:
+        raise RuntimeError(f"Piper failed: {err.decode(errors='ignore')}")
+
+    wav = sa.WaveObject.from_wave_file(outwav)
+    play = wav.play()
+    play.wait_done()
+
+    try:
+        os.unlink(outwav)
+    except Exception:
+        pass
 
 
-
-import requests
 
 def ollama_chat(user_text: str) -> str:
-    """Send prompt to Ollama LLM and read answer aloud"""
-    url = "http://127.0.0.1:11434/v1/chat/completions"
+    """Minimal chat-completions sorğusu (Ollama)"""
     payload = {
-        "model": "mistral:latest",
+        "model": OLLAMA_MODEL,
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "You are a helpful AI assistant. "
-                    "Always respond only in English. "
-                    "Do not translate or repeat in other languages. "
-                    "If the user speaks another language, still answer strictly in English. "
-                    "Never include translations or bilingual text."
+                    "Respond briefly and naturally, like a human conversation partner. "
+                    "Never mention that you are an AI or an assistant. "
+                    "Keep answers short. Always reply in English unless asked otherwise."
                 )
             },
-            {
-                "role": "user",
-                "content": user_text
-            }
+            {"role": "user", "content": user_text}
         ],
         "stream": False
     }
-
     try:
-        resp = requests.post(url, json=payload)
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        answer = data["choices"][0]["message"]["content"].strip()
-        print("🤖 Reply:", answer)
-        speak(answer)  # 🔊 səsli oxut
-        return answer
+        return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         print("❌ LLM request failed:", e)
         return "Error: LLM request failed."
 
 
+def record_and_transcribe():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--text", type=str, help="If provided, skip mic/VAD and chat with this text.")
+    parser.add_argument("--no-tts", action="store_true", help="Disable TTS playback.")
+    parser.add_argument("--tts", choices=["piper", "gtts", "off"], default="piper",
+                        help="Choose TTS engine (default: piper)")
+    args = parser.parse_args()
 
+    # ---- TEXT CHAT MODE ----
+    if args.text is not None:
+        user_text = args.text.strip()
+        if not user_text:
+            print("Empty --text input.")
+            return
+        print(f"📝 Text input: {user_text}")
+        reply = ollama_chat(user_text)
+        print("\n🤖 Reply:\n" + reply)
+        if not args.no_tts and args.tts != "off":
+            try:
+                if args.tts == "piper":
+                    piper_tts(reply)
+                else:
+                    speak_gtts(reply)
+            except Exception as e:
+                print("TTS error:", e)
+        return
 
+    # ---- MIC MODE (VAD → Whisper CPU → LLM → TTS) ----
+    out = Path.home() / "Desktop" / "output.wav"
+    file_path = record_vad(output=str(out), silence_limit=1.2, device=None)
+    if not file_path or not Path(file_path).exists():
+        print("❌ Səs yazıla bilmədi.")
+        return
 
+    print(f"🎧 Yazılmış fayl: {file_path}")
+    print("🧠 Whisper transkripsiya başlayır... (CPU)")
 
+    # *** CPU MODE ***
+    model = WhisperModel("base", device="cpu", compute_type="int8")  # CPU üçün təhlükəsiz
+    segments, info = model.transcribe(str(file_path), vad_filter=True, beam_size=1, best_of=1)
+    print(f"🌐 Dil: {info.language}")
 
+    text = "".join(s.text for s in segments).strip()
+    print("\n📝 Nəticə:")
+    print(text or "[boş]")
 
-def piper_tts(text: str):
-    if not Path(PIPER_MODEL).exists():
-        raise RuntimeError(f"Piper model not found: {PIPER_MODEL}")
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-        outwav = tf.name
-    cmd = [PIPER_BIN, "--model", PIPER_MODEL, "--output_file", outwav,
-           "--length_scale","1.0","--noise_scale","0.33","--noise_w","0.5"]
-    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    _, err = p.communicate(input=text.encode("utf-8"))
-    if p.returncode != 0:
-        raise RuntimeError(f"Piper failed: {err.decode(errors='ignore')}")
-    wav = sa.WaveObject.from_wave_file(outwav)
-    play = wav.play(); play.wait_done()
-    try: os.unlink(outwav)
-    except: pass
-# --- END ADD ---
+    if text:
+        reply = ollama_chat(text)
+        print("\n🤖 Reply:\n" + reply)
+        if not args.no_tts and args.tts != "off":
+            try:
+                if args.tts == "piper":
+                    piper_tts(reply)
+                else:
+                    speak_gtts(reply)
+            except Exception as e:
+                print("TTS error:", e)
 
 
 if __name__ == "__main__":
