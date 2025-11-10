@@ -1,168 +1,331 @@
-# record_and_transcribe.py  (CPU-only, clean)
+#!/usr/bin/env python3
+# record_and_transcribe.py — GPU Whisper + Loop + DeepSeek-R1:8b + Vision (qwen3-vl:latest)
+
 from pathlib import Path
 import argparse
 import os
 import tempfile
 import subprocess
-import json
-
+import datetime
 import requests
-import simpleaudio as sa
+import base64
+import cv2
+import re
 
+from cam_control import CameraControl
 from vad_record import record_vad
 from faster_whisper import WhisperModel
-
-# ---- TTS: Piper (yerli, oflayn) və gTTS (fallback, onlayn) ----
 from gtts import gTTS
 
+# ---------- Paths & Models ----------
 PIPER_BIN   = os.environ.get("PIPER_BIN", str(Path.home() / "Desktop/piper/piper"))
-PIPER_MODEL = str(Path.home() / "Desktop/piper_voices/en_US-ryan-medium.onnx")
+PIPER_MODEL = os.environ.get("PIPER_MODEL", str(Path.home() / "Desktop/piper_voices/en_US-ryan-medium.onnx"))
 
+OLLAMA_URL        = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/v1/chat/completions")
+OLLAMA_MODEL      = os.environ.get("LLM_MODEL", "deepseek-r1:8b")   # Text model
+OLLAMA_VLM_MODEL  = os.environ.get("OLLAMA_VLM_MODEL", "qwen3-vl:latest")  # Vision model
 
+# ---------- Voice command phrase lists (global) ----------
+OPEN_CAM_PHRASES = [
+    "open cam", "open camera", "turn on camera",
+    "kamera aç", "kamera ac", "cam aç", "cam ac"
+]
 
-OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/v1/chat/completions")
-OLLAMA_MODEL = os.environ.get("LLM_MODEL", "mistral:latest")  # səndə quraşdırılmış model adı
+CLOSE_CAM_PHRASES = [
+    "close cam", "close camera", "turn off camera",
+    "kamera bağla", "kamera bagla", "cam bağla", "cam bagla"
+]
 
+SEE_PHRASES = [
+    "what do you see", "what do you see in front", "see in front of the camera",
+    "what is in front of the camera", "what do you see right now",
+    "describe what you see", "nə görürsən", "ne gorursen"
+]
 
+SEE_REGEX = re.compile(
+    r"(what\s+do\s+you\s+see(\s+in\s+front(\s+of\s+the\s+camera)?)?|"
+    r"what\s+is\s+in\s+front\s+of\s+the\s+camera|"
+    r"describe\s+(this|the\s+scene)|"
+    r".*see.*camera)",
+    re.IGNORECASE
+)
+
+WHAT_IS_THIS_PHRASES = [
+    "what is this", "what is this?", "bu nedir", "bu nədir"
+]
+
+# ---------- TTS ----------
 def speak_gtts(text: str, lang="en"):
-    """Fallback TTS: gTTS + mpg123 (internet tələb edir)"""
+    """Online fallback TTS with gTTS (+ mpg123)."""
     try:
         tmp_mp3 = "/tmp/tts.mp3"
-        tts = gTTS(text=text, lang=lang)
-        tts.save(tmp_mp3)
-        os.system(f"mpg123 {tmp_mp3} > /dev/null 2>&1")
+        gTTS(text=text, lang=lang).save(tmp_mp3)
+        subprocess.run(["mpg123", "-q", tmp_mp3], check=False)
     except Exception as e:
         print("TTS(gTTS) error:", e)
 
 
 def piper_tts(text: str):
-    """Offline TTS using Piper"""
+    """Offline TTS using Piper → plays with 'aplay' (simple and robust)."""
     if not Path(PIPER_BIN).exists():
         raise RuntimeError(f"Piper binary not found: {PIPER_BIN}")
     if not Path(PIPER_MODEL).exists():
-        raise RuntimeError(f"Piper model not found: {PIPER_MODEL}")
+        raise RuntimeError(f"Piper model not found:  {PIPER_MODEL}")
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
         outwav = tf.name
 
-    # ---- Burada düzgün indentasiya ----
     cmd = [
         PIPER_BIN,
         "--model", PIPER_MODEL,
         "--output_file", outwav,
-        "--length_scale", "1.30",      # yavaş danışıq
-        "--noise_scale", "0.33",       # artikulyasiya
-        "--noise_w", "0.55",           # intonasiya
-        "--sentence_silence", "0.20"   # cümlələrarası pauza
+        "--length_scale", "1.30",
+        "--noise_scale", "0.33",
+        "--noise_w", "0.55",
+        "--sentence_silence", "0.20",
     ]
-
-    p = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     _, err = p.communicate(input=text.encode("utf-8"))
     if p.returncode != 0:
         raise RuntimeError(f"Piper failed: {err.decode(errors='ignore')}")
-
-    wav = sa.WaveObject.from_wave_file(outwav)
-    play = wav.play()
-    play.wait_done()
-
     try:
-        os.unlink(outwav)
-    except Exception:
-        pass
+        subprocess.run(["aplay", "-q", outwav], check=False)
+    finally:
+        try:
+            os.unlink(outwav)
+        except Exception:
+            pass
 
+# ---------- Vision LLM helper ----------
+def vlm_describe_b64(image_b64: str, prompt="Describe the scene briefly."):
+    payload = {
+        "model": OLLAMA_VLM_MODEL,
+        "messages": [
+            {"role": "system", "content": "Be concise (1-2 sentences)."},
+            {"role": "user", "content": prompt, "images": [image_b64]}
+        ],
+        "stream": False
+    }
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"[VLM error: {e}]"
 
-
+# ---------- Text LLM ----------
 def ollama_chat(user_text: str) -> str:
-    """Minimal chat-completions sorğusu (Ollama)"""
+    """Minimal chat-completions call to local Ollama."""
+    now = datetime.datetime.now().strftime("%B %d, %Y, %H:%M")
+    system_prompt = (
+        f"You are an offline assistant. The current real date and time is {now}. "
+        "Respond naturally and briefly. Never claim you don't know today's date."
+    )
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Respond briefly and naturally, like a human conversation partner. "
-                    "Never mention that you are an AI or an assistant. "
-                    "Keep answers short. Always reply in English unless asked otherwise."
-                )
-            },
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text}
         ],
         "stream": False
     }
     try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        r = requests.post(OLLAMA_URL, json=payload, timeout=60)
+        r.raise_for_status()
+        data = r.json()
         return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         print("❌ LLM request failed:", e)
         return "Error: LLM request failed."
 
+# ---------- One turn (VAD → Whisper → LLM → TTS) ----------
+def handle_single_turn(model: WhisperModel, tts_engine: str, no_tts: bool, cam: CameraControl) -> bool:
+    # ---- normalize helpers ----
+    def norm_text(t: str) -> str:
+        return " ".join(t.lower().strip().split())
 
-def record_and_transcribe():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--text", type=str, help="If provided, skip mic/VAD and chat with this text.")
-    parser.add_argument("--no-tts", action="store_true", help="Disable TTS playback.")
-    parser.add_argument("--tts", choices=["piper", "gtts", "off"], default="piper",
-                        help="Choose TTS engine (default: piper)")
-    args = parser.parse_args()
+    def has_any(text: str, phrases) -> bool:
+        return any(p in text for p in phrases)
 
-    # ---- TEXT CHAT MODE ----
-    if args.text is not None:
-        user_text = args.text.strip()
-        if not user_text:
-            print("Empty --text input.")
-            return
-        print(f"📝 Text input: {user_text}")
-        reply = ollama_chat(user_text)
-        print("\n🤖 Reply:\n" + reply)
-        if not args.no_tts and args.tts != "off":
-            try:
-                if args.tts == "piper":
-                    piper_tts(reply)
-                else:
-                    speak_gtts(reply)
-            except Exception as e:
-                print("TTS error:", e)
-        return
-
-    # ---- MIC MODE (VAD → Whisper CPU → LLM → TTS) ----
     out = Path.home() / "Desktop" / "output.wav"
     file_path = record_vad(output=str(out), silence_limit=1.2, device=None)
     if not file_path or not Path(file_path).exists():
         print("❌ Səs yazıla bilmədi.")
-        return
+        return True
 
     print(f"🎧 Yazılmış fayl: {file_path}")
-    print("🧠 Whisper transkripsiya başlayır... (CPU)")
+    print("🧠 Whisper transkripsiya başlayır...")
 
-    # *** CPU MODE ***
-    model = WhisperModel("base", device="cpu", compute_type="int8")  # CPU üçün təhlükəsiz
     segments, info = model.transcribe(str(file_path), vad_filter=True, beam_size=1, best_of=1)
     print(f"🌐 Dil: {info.language}")
-
     text = "".join(s.text for s in segments).strip()
     print("\n📝 Nəticə:")
     print(text or "[boş]")
 
-    if text:
-        reply = ollama_chat(text)
-        print("\n🤖 Reply:\n" + reply)
+    if not text:
+        return True
+
+    low = norm_text(text)
+
+    # exit
+    if low in {"exit", "quit", "stop"}:
+        print("👋 Çıxış əmri verildi. Sağ ol!")
+        return False
+
+    # --- Camera voice commands (robust) ---
+    if has_any(low, OPEN_CAM_PHRASES):
+        if not cam.open():
+            out_msg = "Camera failed to open."
+        else:
+            out_msg = "Camera opened."
+        print("📷", out_msg)
+        if not no_tts and tts_engine != "off":
+            (piper_tts if tts_engine == "piper" else speak_gtts)(out_msg)
+        return True
+
+    if has_any(low, CLOSE_CAM_PHRASES):
+        cam.close()
+        out_msg = "Camera closed."
+        print("📷", out_msg)
+        if not no_tts and tts_engine != "off":
+            (piper_tts if tts_engine == "piper" else speak_gtts)(out_msg)
+        return True
+
+    if has_any(low, SEE_PHRASES) or SEE_REGEX.search(low):
+        frame = cam.get_frame()
+        if frame is None:
+            msg = "Camera is not open or no frame yet."
+        else:
+            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if not ok:
+                msg = "Failed to encode frame."
+            else:
+                b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+                msg = vlm_describe_b64(
+                    b64,
+                    prompt="Describe briefly (1–2 sentences). If any text exists, include OCR at the end."
+                )
+        print("🖼️ Vision:", msg)
+        if not no_tts and tts_engine != "off":
+            (piper_tts if tts_engine == "piper" else speak_gtts)(msg)
+        return True
+
+    if has_any(low, WHAT_IS_THIS_PHRASES):
+        frame = cam.get_frame()
+        if frame is None:
+            msg = "Camera is not open or no frame yet."
+        else:
+            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+            if not ok:
+                msg = "Failed to encode frame."
+            else:
+                b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+                prompt = (
+                    "Identify this object. Give top-3 guesses with 1-line reasons. "
+                    "If any text/logos exist, transcribe (OCR) and use them. "
+                    "Format: 1) <name> — reason; 2) ...; 3) ...; "
+                    "If uncertain, say 'low confidence'."
+                )
+                msg = vlm_describe_b64(b64, prompt=prompt)
+        print("🖼️ Vision:", msg)
+        if not no_tts and tts_engine != "off":
+            (piper_tts if tts_engine == "piper" else speak_gtts)(msg)
+        return True
+
+    if low.startswith("analyze frame:"):
+        q = text.split(":", 1)[1].strip() or "Describe this image."
+        frame = cam.get_frame()
+        if frame is None:
+            msg = "Camera is not open or no frame yet."
+        else:
+            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if ok:
+                b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+                msg = vlm_describe_b64(b64, prompt=q)
+            else:
+                msg = "Failed to encode frame."
+        print("🖼️ Vision:", msg)
+        if not no_tts and tts_engine != "off":
+            (piper_tts if tts_engine == "piper" else speak_gtts)(msg)
+        return True
+    # --- END camera commands ---
+
+    # Fallback: plain LLM reply
+    reply = ollama_chat(text)
+    print("\n🤖 Reply:\n" + reply + "\n")
+
+    if not no_tts and tts_engine != "off":
+        try:
+            if tts_engine == "piper":
+                piper_tts(reply)
+            else:
+                speak_gtts(reply)
+        except Exception as e:
+            print("TTS error:", e)
+
+    return True
+
+# ---------- Loop mode ----------
+def loop_mode(tts_engine: str, no_tts: bool):
+    print("🎤 Loop mode ...")
+    try:
+        print("🧠 Loading Whisper on GPU (cuda, int8_float16)...")
+        model = WhisperModel("base", device="cuda", compute_type="int8_float16")
+    except Exception as e:
+        print(f"⚠️ CUDA init failed: {e}\n➡️ Falling back to CPU (int8).")
+        model = WhisperModel("base", device="cpu", compute_type="int8")
+
+    cam = CameraControl(index=0)   # default webcam
+
+    try:
+        while True:
+            cont = handle_single_turn(model, tts_engine, no_tts, cam)
+            if not cont:
+                break
+    except KeyboardInterrupt:
+        print("\n👋 Ctrl+C — çıxılır.")
+    finally:
+        cam.close()
+
+# ---------- CLI ----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--text", type=str, help="If provided, skip mic/VAD and chat with this text (single run).")
+    ap.add_argument("--no-tts", action="store_true", help="Disable TTS playback.")
+    ap.add_argument("--tts", choices=["piper", "gtts", "off"], default="piper",
+                    help="Choose TTS engine (default: piper)")
+    ap.add_argument("--once", action="store_true", help="Run only one turn instead of loop.")
+    args = ap.parse_args()
+
+    if args.text is not None:
+        user_text = args.text.strip()
+        if not user_text:
+            print("Empty --text input."); return
+        print(f"📝 Text input: {user_text}")
+        reply = ollama_chat(user_text)
+        print("\n🤖 Reply:\n" + reply + "\n")
         if not args.no_tts and args.tts != "off":
             try:
-                if args.tts == "piper":
-                    piper_tts(reply)
-                else:
-                    speak_gtts(reply)
+                piper_tts(reply) if args.tts == "piper" else speak_gtts(reply)
             except Exception as e:
                 print("TTS error:", e)
+        return
 
+    if args.once:
+        try:
+            print("🧠 Loading Whisper on GPU (cuda, int8_float16)...")
+            model = WhisperModel("base", device="cuda", compute_type="int8_float16")
+        except Exception as e:
+            print(f"⚠️ CUDA init failed: {e}\n➡️ Falling back to CPU (int8).")
+            model = WhisperModel("base", device="cpu", compute_type="int8")
+        cam = CameraControl(index=0)
+        try:
+            _ = handle_single_turn(model, args.tts, args.no_tts, cam)
+        finally:
+            cam.close()
+    else:
+        loop_mode(args.tts, args.no_tts)
 
 if __name__ == "__main__":
-    record_and_transcribe()
+    main()
