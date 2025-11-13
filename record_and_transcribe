@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# record_and_transcribe.py — GPU Whisper + Loop + DeepSeek-R1:8b + Vision (qwen3-vl:latest)
+# record_and_transcribe.py — GPU Whisper + Loop + DeepSeek-R1:8b + Vision (llava:7b)
 
 from pathlib import Path
 import argparse
@@ -23,11 +23,16 @@ from gtts import gTTS
 PIPER_BIN   = os.environ.get("PIPER_BIN", str(Path.home() / "Desktop/piper/piper"))
 PIPER_MODEL = os.environ.get("PIPER_MODEL", str(Path.home() / "Desktop/piper_voices/en_US-ryan-medium.onnx"))
 
+# Text LLM (DeepSeek-R1) — OpenAI compatible endpoint
 OLLAMA_URL        = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/v1/chat/completions")
 OLLAMA_MODEL      = os.environ.get("LLM_MODEL", "deepseek-r1:8b")   # Text model
-OLLAMA_VLM_MODEL  = os.environ.get("OLLAMA_VLM_MODEL", "qwen3-vl:latest")  # Vision model
+
+# Vision LLM (LLaVA) — native /api/generate endpoint
+OLLAMA_VLM_MODEL  = os.environ.get("OLLAMA_VLM_MODEL", "llava:7b")
+OLLAMA_NATIVE_URL = os.environ.get("OLLAMA_NATIVE_URL", "http://127.0.0.1:11434")
 
 AUTO_DESCRIBE_ON_OPEN = False
+
 
 
 # ---------- Voice command phrase lists (global) ----------
@@ -54,6 +59,27 @@ SEE_REGEX = re.compile(
     r".*see.*camera)",
     re.IGNORECASE
 )
+IMAGE_QUESTION_PHRASES = [
+    "what is in the picture",
+    "what is in this picture",
+    "what is in the image",
+    "what is in this image",
+    "what is in the photo",
+    "what is in this photo",
+    "describe the picture",
+    "describe this picture",
+    "describe the image",
+    "describe this image",
+    "describe the photo",
+    "describe this photo",
+]
+
+IMAGE_QUESTION_REGEX = re.compile(
+    r"(what\s+is\s+in\s+(this\s+)?(picture|image|photo)|"
+    r"describe\s+(this\s+)?(picture|image|photo))",
+    re.IGNORECASE
+)
+
 
 WHAT_IS_THIS_PHRASES = [
     "what is this", "what is this?", "bu nedir", "bu nədir"
@@ -72,6 +98,26 @@ EMOTION_PHRASES = [
     "what is my expression", "do i look happy", "do i look angry",
     "üz ifadəm nədir", "men indi esebiyem", "mən indi əsəbiyəm", "gülürem", "gulurem"
 ]
+WHAT_IS_THIS_PHRASES = [
+    "what is this", "what is this?", "bu nedir", "bu nədir"
+]
+
+HOLDING_ITEM_PHRASES = [
+    "what am i holding",
+    "what's the item i'm holding",
+    "what is the item i'm holding",
+    "what is in my hand",
+    "what's in my hand",
+    "what item am i holding",
+]
+
+HOLDING_ITEM_REGEX = re.compile(
+    r"(what('| i)?s\s+the\s+item\s+i('m| am)\s+holding|"
+    r"what\s+am\s+i\s+holding|"
+    r"what('| i)?s\s+in\s+my\s+hand)",
+    re.IGNORECASE,
+)
+
 
 
 # ---------- TTS ----------
@@ -121,43 +167,30 @@ def piper_tts(text: str):
         
 
 # ---------- Vision LLM helper ----------
+# ---------- Vision LLM helper ----------
 def vlm_describe_b64(image_b64: str, prompt="Describe the scene briefly."):
     """
-    Compatible with Ollama v0.12.x vision models (qwen3-vl, minicpm-v, llava).
+    Send a base64-encoded JPEG frame to Ollama vision model (llava:7b)
+    using the native /api/generate endpoint with `images` array.
     """
-    import requests
-
-    # Ollama vision API requires base64 as "data:image/jpeg;base64,..." string
-    data_url = f"data:image/jpeg;base64,{image_b64}"
-
-    # ✅ NEW: content array format (used in 0.12.x)
     payload = {
         "model": OLLAMA_VLM_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}}
-                ]
-            }
-        ],
-        "stream": False
+        "prompt": prompt,
+        "stream": False,
+        # IMPORTANT: here we pass *raw* base64, NOT "data:image/jpeg;base64,..."
+        "images": [image_b64],
     }
 
     try:
-        r = requests.post("http://127.0.0.1:11434/api/chat", json=payload, timeout=60)
+        # 🔴 BURANI DƏYİŞ
+        r = requests.post(f"{OLLAMA_NATIVE_URL}/api/generate", json=payload, timeout=60)
         r.raise_for_status()
         data = r.json()
-        # ✅ consistent structure across models
-        if "message" in data and "content" in data["message"]:
-            return data["message"]["content"].strip()
-        elif "choices" in data:
-            return data["choices"][0]["message"]["content"].strip()
-        else:
-            return "[VLM: unexpected response]"
+        return (data.get("response") or "").strip() or "[VLM: empty response]"
     except Exception as e:
         return f"[VLM error: {e}]"
+
+
 
 
 
@@ -240,6 +273,12 @@ def handle_single_turn(model: WhisperModel, tts_engine: str, no_tts: bool, cam: 
 
     low = norm_text(text)
 
+    if low.startswith("watch the item i am holding"):
+        low = "what is the item i am holding"
+    elif low.startswith("watch the item i'm holding"):
+        low = "what is the item i'm holding"
+
+    
     # exit
     if low in {"exit", "quit", "stop"}:
         print("👋 Çıxış əmri verildi. Sağ ol!")
@@ -329,7 +368,12 @@ def handle_single_turn(model: WhisperModel, tts_engine: str, no_tts: bool, cam: 
 
 
     
-    if has_any(low, WHAT_IS_THIS_PHRASES):
+    if (
+        has_any(low, WHAT_IS_THIS_PHRASES)
+        or has_any(low, HOLDING_ITEM_PHRASES)
+        or HOLDING_ITEM_REGEX.search(low)
+    ):
+
         frame = cam.get_frame()
         if frame is None:
             msg = "Camera is not open or no frame yet."
@@ -340,11 +384,12 @@ def handle_single_turn(model: WhisperModel, tts_engine: str, no_tts: bool, cam: 
             else:
                 b64 = base64.b64encode(buf.tobytes()).decode("ascii")
                 prompt = (
-                    "Identify this object. Give top-3 guesses with 1-line reasons. "
-                    "If any text/logos exist, transcribe (OCR) and use them. "
-                    "Format: 1) <name> — reason; 2) ...; 3) ...; "
-                    "If uncertain, say 'low confidence'."
+                    "Identify the single most likely object the person is holding in this image. "
+                    "Give exactly ONE answer in the format '<name> — short reason'. "
+                    "If any text or logos are visible, mention them in the reason. "
+                    "Do NOT list multiple options."
                 )
+
                 msg = vlm_describe_b64(b64, prompt=prompt)
         print("🖼️ Vision:", msg)
         if not no_tts and tts_engine != "off":
@@ -389,10 +434,12 @@ def loop_mode(tts_engine: str, no_tts: bool):
     print("🎤 Loop mode ...")
     try:
         print("🧠 Loading Whisper on GPU (cuda, int8_float16)...")
-        model = WhisperModel("base", device="cuda", compute_type="int8_float16")
+        model = WhisperModel("small.en", device="cuda", compute_type="int8_float16")
+
     except Exception as e:
         print(f"⚠️ CUDA init failed: {e}\n➡️ Falling back to CPU (int8).")
-        model = WhisperModel("base", device="cpu", compute_type="int8")
+        model = WhisperModel("small.en", device="cuda", compute_type="int8_float16")
+
 
     cam = CameraControl(index=0)   # default webcam
 
@@ -433,10 +480,12 @@ def main():
     if args.once:
         try:
             print("🧠 Loading Whisper on GPU (cuda, int8_float16)...")
-            model = WhisperModel("base", device="cuda", compute_type="int8_float16")
+            mmodel = WhisperModel("small.en", device="cuda", compute_type="int8_float16")
+
         except Exception as e:
             print(f"⚠️ CUDA init failed: {e}\n➡️ Falling back to CPU (int8).")
-            model = WhisperModel("base", device="cpu", compute_type="int8")
+            model = WhisperModel("small.en", device="cuda", compute_type="int8_float16")
+
         cam = CameraControl(index=0)
         try:
             _ = handle_single_turn(model, args.tts, args.no_tts, cam)
