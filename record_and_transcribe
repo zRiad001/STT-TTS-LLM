@@ -11,6 +11,8 @@ import requests
 import base64
 import cv2
 import re
+import time
+
 
 from cam_control import CameraControl
 from vad_record import record_vad
@@ -25,14 +27,17 @@ OLLAMA_URL        = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/v1/chat
 OLLAMA_MODEL      = os.environ.get("LLM_MODEL", "deepseek-r1:8b")   # Text model
 OLLAMA_VLM_MODEL  = os.environ.get("OLLAMA_VLM_MODEL", "qwen3-vl:latest")  # Vision model
 
+AUTO_DESCRIBE_ON_OPEN = False
+
+
 # ---------- Voice command phrase lists (global) ----------
 OPEN_CAM_PHRASES = [
-    "open cam", "open camera", "turn on camera",
+    "open cam", "open camera", "turn on camera","turn on the camera",
     "kamera aç", "kamera ac", "cam aç", "cam ac"
 ]
 
 CLOSE_CAM_PHRASES = [
-    "close cam", "close camera", "turn off camera",
+    "close cam", "close camera", "turn off camera","turn off the camera",
     "kamera bağla", "kamera bagla", "cam bağla", "cam bagla"
 ]
 
@@ -61,6 +66,13 @@ SHOW_CAM_PHRASES = [
 HIDE_CAM_PHRASES = [
     "hide camera", "hide cam", "close preview", "pəncərəni bağla", "pencereni bagla"
 ]
+
+EMOTION_PHRASES = [
+    "am i smiling", "am i angry", "am i happy", "am i sad",
+    "what is my expression", "do i look happy", "do i look angry",
+    "üz ifadəm nədir", "men indi esebiyem", "mən indi əsəbiyəm", "gülürem", "gulurem"
+]
+
 
 # ---------- TTS ----------
 def speak_gtts(text: str, lang="en"):
@@ -104,23 +116,56 @@ def piper_tts(text: str):
         except Exception:
             pass
 
+
+
+        
+
 # ---------- Vision LLM helper ----------
 def vlm_describe_b64(image_b64: str, prompt="Describe the scene briefly."):
+    """
+    Compatible with Ollama v0.12.x vision models (qwen3-vl, minicpm-v, llava).
+    """
+    import requests
+
+    # Ollama vision API requires base64 as "data:image/jpeg;base64,..." string
+    data_url = f"data:image/jpeg;base64,{image_b64}"
+
+    # ✅ NEW: content array format (used in 0.12.x)
     payload = {
         "model": OLLAMA_VLM_MODEL,
         "messages": [
-            {"role": "system", "content": "Be concise (1-2 sentences)."},
-            {"role": "user", "content": prompt, "images": [image_b64]}
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                ]
+            }
         ],
         "stream": False
     }
+
     try:
-        r = requests.post(OLLAMA_URL, json=payload, timeout=60)
+        r = requests.post("http://127.0.0.1:11434/api/chat", json=payload, timeout=60)
         r.raise_for_status()
         data = r.json()
-        return data["choices"][0]["message"]["content"].strip()
+        # ✅ consistent structure across models
+        if "message" in data and "content" in data["message"]:
+            return data["message"]["content"].strip()
+        elif "choices" in data:
+            return data["choices"][0]["message"]["content"].strip()
+        else:
+            return "[VLM: unexpected response]"
     except Exception as e:
         return f"[VLM error: {e}]"
+
+
+
+
+
+
+
+
 
 # ---------- Text LLM ----------
 def ollama_chat(user_text: str) -> str:
@@ -147,8 +192,27 @@ def ollama_chat(user_text: str) -> str:
         print("❌ LLM request failed:", e)
         return "Error: LLM request failed."
 
+
+
+
+
+
+
+
 # ---------- One turn (VAD → Whisper → LLM → TTS) ----------
 def handle_single_turn(model: WhisperModel, tts_engine: str, no_tts: bool, cam: CameraControl) -> bool:
+
+
+    def grab_frame(cam, retries=20, delay=0.05):
+        for _ in range(retries):
+            f = cam.get_frame()
+            if f is not None:
+                return f
+            time.sleep(delay)
+        return None
+
+
+    
     # ---- normalize helpers ----
     def norm_text(t: str) -> str:
         return " ".join(t.lower().strip().split())
@@ -191,7 +255,32 @@ def handle_single_turn(model: WhisperModel, tts_engine: str, no_tts: bool, cam: 
         if not no_tts and tts_engine != "off":
             (piper_tts if tts_engine == "piper" else speak_gtts)(out_msg)
         return True
+    
+    
+    if has_any(low, EMOTION_PHRASES):
+        frame = grab_frame(cam)
+        if frame is None:
+            msg = "Camera is open but no frame yet."
+        else:
+            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+            if not ok:
+                msg = "Failed to encode frame."
+            else:
+                b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+                # Sadə, etibarlı prompt: qısa cavab + inam dərəcəsi
+                prompt = (
+                    "Analyze the person's facial expression in this image. "
+                    "Answer briefly with the most likely emotion (e.g., neutral, happy/smiling, angry, sad, surprised) "
+                    "and provide a confidence level 0-100%. If the face is not clearly visible, say 'uncertain'."
+                )
+                msg = vlm_describe_b64(b64, prompt=prompt)
+        print("🙂 Emotion:", msg)
+        if not no_tts and tts_engine != "off":
+            (piper_tts if tts_engine=="piper" else speak_gtts)(msg)
+        return True
 
+    
+    
     if has_any(low, CLOSE_CAM_PHRASES):
         cam.close()
         out_msg = "Camera closed."
