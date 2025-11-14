@@ -1,3 +1,4 @@
+# vad_record.py  — plain VAD (your original settings)
 import sounddevice as sd
 import numpy as np
 import webrtcvad
@@ -10,6 +11,13 @@ RATE = 16000
 FRAME_DURATION = 30  # ms (allowed: 10 / 20 / 30)
 FRAME_SIZE = int(RATE * FRAME_DURATION / 1000)
 
+# ---- burada yazmalısan ----
+PRE_ROLL_MS = 250
+PRE_ROLL_FRAMES = PRE_ROLL_MS // FRAME_DURATION
+
+
+
+
 # VAD AGGRESSIVENESS:
 # 0 = most strict (harder to trigger, needs clear voice)
 # 3 = most sensitive (triggers on tiny noise)
@@ -18,17 +26,18 @@ VAD = webrtcvad.Vad(0)   # was 1 before -> now less sensitive
 MAX_DURATION_S = 120     # safety cap
 
 # how "sticky" recording is:
-START_TRIGGER_FRAMES = 10   # how many voiced frames in a row before we "start"
-STOP_TRIGGER_FRAMES  = 45   # how many silence frames in a row before we "stop"
+START_TRIGGER_FRAMES = 10  # how many voiced frames in a row before we "start"
+STOP_TRIGGER_FRAMES  = 45  # how many silence frames in a row before we "stop"
 
 
-def record_vad(output="output.wav", silence_limit=1.6, device=None):
+def record_vad(output="output.wav", silence_limit=1.2, device=None):
     """
     Voice-activated recorder:
     - waits until it hears real voice (not tiny noise)
     - records
     - stops after sustained silence
     """
+    pre_roll = collections.deque(maxlen=PRE_ROLL_FRAMES)
 
     if device is not None:
         sd.default.device = device
@@ -76,17 +85,19 @@ def record_vad(output="output.wav", silence_limit=1.6, device=None):
                 is_speech = VAD.is_speech(frame.tobytes(), RATE)
 
                 if not recording:
-                    # we haven't started yet
+                    pre_roll.append(frame.copy())        # <-- YENİ
                     if is_speech:
                         voiced_streak += 1
                         if voiced_streak >= START_TRIGGER_FRAMES:
                             print("▶️ Səs aşkarlandı, yazma başladı...")
                             recording = True
+                            frames.extend(list(pre_roll))   # <-- YENİ
                             frames.append(frame.copy())
                             ring_buffer.clear()
                             silence_streak = 0
                     else:
-                        voiced_streak = 0  # reset if no consistent speech
+                        voiced_streak = 0
+
                 else:
                     # we are already recording
                     if is_speech:
@@ -108,7 +119,7 @@ def record_vad(output="output.wav", silence_limit=1.6, device=None):
             try:
                 with wave.open(output, 'wb') as wf:
                     wf.setnchannels(1)
-                    wf.setsampwidth(2)
+                    wf.setsampwidth(2)  # int16
                     wf.setframerate(RATE)
                     wf.writeframes(np.concatenate(frames).tobytes())
 
