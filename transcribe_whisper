@@ -2,10 +2,20 @@ import sys
 from faster_whisper import WhisperModel
 from pathlib import Path
 
-# Parametrlər: model ölçüsü və hesablamanın tipi
-MODEL_SIZE = "base"   # "tiny", "base", "small" (VM-də "base int8" yaxşı balansdır)
-COMPUTE    = "int8"   # "int8", "int8_float16", "int16", "float32"
-DEVICE     = "cpu"    # VM-də CPU
+# ===== Settings =====
+# GPU üçün daha dəqiq model:
+MODEL_SIZE = "small.en"        # "small.en" ingilis komanda üçün çox yaxşıdır
+COMPUTE    = "int8_float16"    # GPU üçün ideal balans
+DEVICE     = "cuda"            # GPU
+
+# Komanda konteksti (Whisper-ə hint veririk)
+COMMAND_PROMPT = (
+    "This audio contains short voice commands for a local assistant. "
+    "Possible commands include: open camera, close camera, show camera, hide camera, "
+    "turn on camera, turn off camera, what do you see in front of the camera, "
+    "what is in the picture, analyze frame, and similar phrases. "
+    "Transcribe these commands clearly and literally."
+)
 
 def transcribe_file(audio_path: str):
     audio = Path(audio_path)
@@ -16,14 +26,24 @@ def transcribe_file(audio_path: str):
     print(f"🔊 Fayl: {audio}")
     print(f"🧠 Model: {MODEL_SIZE}, device={DEVICE}, compute_type={COMPUTE}")
 
-    model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE)
+    # Əvvəl GPU, alınmasa CPU fallback
+    try:
+        model = WhisperModel(MODEL_SIZE, device="cuda", compute_type=COMPUTE)
+        using_device = "cuda"
+    except Exception as e:
+        print(f"⚠️ CUDA alınmadı ({e}), CPU-ya keçirəm...")
+        model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+        using_device = "cpu"
+
+    print(f"🧠 Real device: {using_device}")
 
     segments, info = model.transcribe(
         str(audio),
-        vad_filter=True,       # daxili VAD filtri kömək edir
-        beam_size=1,           # CPU-da sürət üçün 1
-        best_of=1,
-        language=None          # None = avtomatik dil aşkarlanması
+        vad_filter=True,       # daxili VAD filtri
+        beam_size=5,           # daha dəqiq
+        best_of=5,
+        language="en",         # komanda dili əsasən ingilisdirsə
+        initial_prompt=COMMAND_PROMPT,
     )
     print(f"🌐 Dil: {info.language} | no_speech_prob={getattr(info, 'no_speech_prob', None)}")
 
